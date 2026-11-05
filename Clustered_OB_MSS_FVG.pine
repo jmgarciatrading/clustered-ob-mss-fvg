@@ -1,0 +1,352 @@
+//@version=6
+indicator("Clustered OB + MSS + FVG", overlay = true, max_bars_back = 500,
+     max_boxes_count = 240, max_lines_count = 120, max_labels_count = 120)
+
+// This indicator deliberately treats an OB, MSS, and FVG as one event. Nothing is
+// rendered until all three components have been associated inside one bounded
+// displacement leg. It is a structural visualizer, not a trading strategy.
+
+// ───────────────────────────────────────────────
+// Inputs
+// ───────────────────────────────────────────────
+string GRP_COLORS = "Colors"
+color bullObColor = input.color(color.rgb(30, 136, 229), "Bullish Order Block", group = GRP_COLORS)
+color bearObColor = input.color(color.rgb(229, 57, 53), "Bearish Order Block", group = GRP_COLORS)
+color bullFvgColor = input.color(color.rgb(0, 172, 193), "Bullish FVG", group = GRP_COLORS)
+color bearFvgColor = input.color(color.rgb(255, 143, 0), "Bearish FVG", group = GRP_COLORS)
+color bullMssColor = input.color(color.rgb(46, 125, 50), "Bullish MSS", group = GRP_COLORS)
+color bearMssColor = input.color(color.rgb(198, 40, 40), "Bearish MSS", group = GRP_COLORS)
+
+string GRP_STRUCTURE = "Structure"
+int swingLength = input.int(3, "MSS Swing Length", minval = 1, maxval = 50, group = GRP_STRUCTURE,
+     tooltip = "Pivots become usable only after this many right-side bars have closed.")
+
+string GRP_DISPLAY = "Display"
+const string DISPLAY_LATEST = "Latest Cluster"
+const string DISPLAY_ALL = "All Clusters"
+string displayMode = input.string(DISPLAY_LATEST, "Display Mode",
+     options = [DISPLAY_LATEST, DISPLAY_ALL], group = GRP_DISPLAY)
+
+string GRP_EXTENSION = "Extension"
+bool extendZones = input.bool(true, "Extend", group = GRP_EXTENSION)
+bool extendUntilMitigated = input.bool(false, "Extend Until Mitigated", group = GRP_EXTENSION,
+     tooltip = "Has no effect when Extend is disabled. Each zone stops independently on its first post-creation touch.")
+
+string GRP_TIME = "Time Window"
+bool useTimeWindow = input.bool(false, "Use Time Window", group = GRP_TIME)
+int startHour = input.int(9, "Start Time", minval = 0, maxval = 23, group = GRP_TIME, inline = "start")
+int startMinute = input.int(30, "Minute", minval = 0, maxval = 59, group = GRP_TIME, inline = "start")
+int endHour = input.int(10, "End Time", minval = 0, maxval = 23, group = GRP_TIME, inline = "end")
+int endMinute = input.int(30, "Minute", minval = 0, maxval = 59, group = GRP_TIME, inline = "end")
+string timeZone = input.string("America/New_York", "Time Zone", group = GRP_TIME,
+     tooltip = "Use an IANA timezone. America/New_York automatically follows US daylight-saving transitions.")
+
+// ───────────────────────────────────────────────
+// Internal policy and state
+// ───────────────────────────────────────────────
+// Twelve bars is only a hard safety cap. Causal association comes from the exact
+// uninterrupted displacement suffix ending on the MSS bar, not from proximity.
+const int MAX_ASSOCIATION_BARS = 12
+const int MAX_STORED_CLUSTERS = 100
+
+const int DIR_BULL = 1
+const int DIR_BEAR = -1
+
+const int STATE_NONE = 0
+const int STATE_MSS_DETECTED = 1
+const int STATE_DISPLACEMENT_IDENTIFIED = 2
+const int STATE_OB_IDENTIFIED = 3
+const int STATE_FVG_IDENTIFIED = 4
+const int STATE_CLUSTER_VALIDATED = 5
+const int STATE_ACTIVE = 6
+const int STATE_MITIGATED = 7
+
+type Cluster
+    int direction
+    int state
+    int creationBar
+    int mssBar
+    float mssLevel
+    int obBar
+    float obTop
+    float obBottom
+    int fvgLeftBar
+    int fvgRightBar
+    float fvgTop
+    float fvgBottom
+    bool obMitigated
+    bool fvgMitigated
+    bool isVisible
+    box obBox
+    box fvgBox
+    line mssLine
+    label mssLabel
+
+var array<Cluster> clusters = array.new<Cluster>()
+
+// ───────────────────────────────────────────────
+// Detection and qualification helpers
+// ───────────────────────────────────────────────
+f_isWithinTimeWindow() =>
+    int barMinutes = hour(time, timeZone) * 60 + minute(time, timeZone)
+    int startMinutes = startHour * 60 + startMinute
+    int endMinutes = endHour * 60 + endMinute
+    bool inside = startMinutes < endMinutes ?
+         (barMinutes >= startMinutes and barMinutes < endMinutes) :
+         startMinutes > endMinutes ?
+         (barMinutes >= startMinutes or barMinutes < endMinutes) : true
+    not useTimeWindow or inside
+
+// A displacement is the maximal suffix ending on the MSS bar in which every bar:
+//   1) has a body in the MSS direction, and
+//   2) closes beyond the preceding candle's directional extreme.
+// The first failure terminates the leg. Requiring at least two displacement bars
+// provides enough causal sequence for a three-candle FVG using the anchor as candle 1.
+f_isDisplacementBar(int direction, int offset) =>
+    direction == DIR_BULL ?
+         close[offset] > open[offset] and close[offset] > high[offset + 1] :
+         close[offset] < open[offset] and close[offset] < low[offset + 1]
+
+f_detectDisplacement(int direction) =>
+    int displacementStartBar = na
+    int displacementEndBar = bar_index
+    int displacementBarCount = 0
+    // At most 11 displacement bars are allowed so the anchor-to-MSS span remains
+    // inside the 12-bar safety bound.
+    for offset = 0 to MAX_ASSOCIATION_BARS - 2
+        if f_isDisplacementBar(direction, offset)
+            displacementStartBar := bar_index - offset
+            displacementBarCount += 1
+        else
+            break
+    bool valid = displacementBarCount >= 2
+    [valid, displacementStartBar, displacementEndBar, displacementBarCount]
+
+// The OB is not selected by a broad backward search. It must be the candle exactly
+// one bar before the identified displacement start, and it must be opposing.
+f_identifyDisplacementOb(int direction, int displacementStartBar, int displacementEndBar) =>
+    int obBar = na
+    float obTop = na
+    float obBottom = na
+    bool valid = false
+    if not na(displacementStartBar)
+        int anchorOffset = bar_index - displacementStartBar + 1
+        bool insideSafetyBound = displacementEndBar - (displacementStartBar - 1) <= MAX_ASSOCIATION_BARS
+        bool opposing = direction == DIR_BULL ?
+             close[anchorOffset] < open[anchorOffset] : close[anchorOffset] > open[anchorOffset]
+        if insideSafetyBound and opposing
+            valid := true
+            obBar := displacementStartBar - 1
+            obTop := high[anchorOffset]
+            obBottom := low[anchorOffset]
+    [valid, obBar, obTop, obBottom]
+
+// Search only inside the already-identified displacement, never across the broad
+// safety envelope. If the leg creates multiple FVGs, select the earliest one.
+f_identifyDisplacementFvg(int direction, int displacementStartBar, int displacementEndBar, int obBar) =>
+    int fvgLeftBar = na
+    int fvgRightBar = na
+    float fvgTop = na
+    float fvgBottom = na
+    for offset = MAX_ASSOCIATION_BARS - 2 to 0
+        int rightBar = bar_index - offset
+        int leftBar = rightBar - 2
+        bool inDisplacement = not na(displacementStartBar) and rightBar >= displacementStartBar and
+             rightBar <= displacementEndBar and leftBar >= obBar
+        bool gap = direction == DIR_BULL ? high[offset + 2] < low[offset] : low[offset + 2] > high[offset]
+        if na(fvgRightBar) and inDisplacement and gap
+            fvgLeftBar := leftBar
+            fvgRightBar := rightBar
+            fvgTop := direction == DIR_BULL ? low[offset] : low[offset + 2]
+            fvgBottom := direction == DIR_BULL ? high[offset + 2] : high[offset]
+    [not na(fvgRightBar), fvgLeftBar, fvgRightBar, fvgTop, fvgBottom]
+
+f_validateCluster(int mssBar, int displacementStartBar, int displacementEndBar,
+     int obBar, int fvgLeftBar, int fvgRightBar) =>
+    displacementEndBar == mssBar and obBar + 1 == displacementStartBar and
+         fvgLeftBar >= obBar and fvgRightBar >= displacementStartBar and
+         fvgRightBar <= displacementEndBar and mssBar - obBar <= MAX_ASSOCIATION_BARS
+
+f_zoneTouched(float zoneTop, float zoneBottom) =>
+    high >= zoneBottom and low <= zoneTop
+
+f_deleteVisuals(Cluster cluster) =>
+    if cluster.isVisible
+        box.delete(cluster.obBox)
+        box.delete(cluster.fvgBox)
+        line.delete(cluster.mssLine)
+        label.delete(cluster.mssLabel)
+        cluster.obBox := na
+        cluster.fvgBox := na
+        cluster.mssLine := na
+        cluster.mssLabel := na
+        cluster.isVisible := false
+
+f_findReclaimableCluster() =>
+    int result = -1
+    int clusterCount = array.size(clusters)
+    if clusterCount > 0
+        for index = 0 to clusterCount - 1
+            Cluster cluster = array.get(clusters, index)
+            if result == -1 and cluster.state == STATE_MITIGATED
+                result := index
+    result
+
+// Detection creates logical state without drawings. Display policy decides which
+// validated logical clusters receive visual objects.
+f_buildCluster(int direction, int creationBar, int mssBar, float mssLevel,
+     int obBar, float obTop, float obBottom, int fvgLeftBar, int fvgRightBar,
+     float fvgTop, float fvgBottom) =>
+    Cluster.new(direction, STATE_ACTIVE, creationBar, mssBar, mssLevel, obBar, obTop, obBottom,
+         fvgLeftBar, fvgRightBar, fvgTop, fvgBottom, false, false, false,
+         na, na, na, na)
+
+f_renderCluster(Cluster cluster, int mssSwingBar) =>
+    color obColor = cluster.direction == DIR_BULL ? bullObColor : bearObColor
+    color fvgColor = cluster.direction == DIR_BULL ? bullFvgColor : bearFvgColor
+    color mssColor = cluster.direction == DIR_BULL ? bullMssColor : bearMssColor
+    string mssText = cluster.direction == DIR_BULL ? "Bullish MSS" : "Bearish MSS"
+    labelStyle = cluster.direction == DIR_BULL ? label.style_label_up : label.style_label_down
+    cluster.obBox := box.new(cluster.obBar, cluster.obTop, cluster.obBar + 1, cluster.obBottom,
+         xloc = xloc.bar_index, border_color = obColor, bgcolor = color.new(obColor, 82))
+    cluster.fvgBox := box.new(cluster.fvgLeftBar, cluster.fvgTop, cluster.fvgRightBar + 1,
+         cluster.fvgBottom, xloc = xloc.bar_index, border_color = fvgColor,
+         bgcolor = color.new(fvgColor, 82))
+    cluster.mssLine := line.new(mssSwingBar, cluster.mssLevel, cluster.mssBar, cluster.mssLevel,
+         xloc = xloc.bar_index, color = mssColor, width = 2)
+    cluster.mssLabel := label.new(cluster.mssBar, cluster.mssLevel, mssText,
+         xloc = xloc.bar_index, style = labelStyle, color = mssColor,
+         textcolor = color.white, size = size.tiny)
+    cluster.isVisible := true
+
+// Resource cleanup never removes an active cluster. If all 100 stored clusters are
+// still active, a new cluster is skipped instead of destroying live structure.
+f_storeCluster(Cluster cluster) =>
+    bool stored = false
+    if array.size(clusters) >= MAX_STORED_CLUSTERS
+        int reclaimIndex = f_findReclaimableCluster()
+        if reclaimIndex >= 0
+            Cluster reclaimed = array.remove(clusters, reclaimIndex)
+            f_deleteVisuals(reclaimed)
+    if array.size(clusters) < MAX_STORED_CLUSTERS
+        array.push(clusters, cluster)
+        stored := true
+    stored
+
+// Latest mode removes drawings only. Logical cluster records remain in `clusters`
+// and continue through the same mitigation lifecycle as visible records.
+f_applyDisplayPolicy(Cluster newestCluster, int mssSwingBar) =>
+    if displayMode == DISPLAY_LATEST
+        int clusterCount = array.size(clusters)
+        if clusterCount > 0
+            for index = 0 to clusterCount - 1
+                Cluster storedCluster = array.get(clusters, index)
+                if storedCluster.isVisible
+                    f_deleteVisuals(storedCluster)
+    f_renderCluster(newestCluster, mssSwingBar)
+
+// ───────────────────────────────────────────────
+// Confirmed swings and MSS detection
+// ───────────────────────────────────────────────
+float confirmedPivotHigh = ta.pivothigh(high, swingLength, swingLength)
+float confirmedPivotLow = ta.pivotlow(low, swingLength, swingLength)
+
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+var int lastBrokenHighBar = na
+var int lastBrokenLowBar = na
+
+if not na(confirmedPivotHigh)
+    lastSwingHigh := confirmedPivotHigh
+    lastSwingHighBar := bar_index - swingLength
+
+if not na(confirmedPivotLow)
+    lastSwingLow := confirmedPivotLow
+    lastSwingLowBar := bar_index - swingLength
+
+// Signals are close-confirmed on realtime bars. The identical condition runs on
+// historical bars, so no separate historical reconstruction path exists.
+bool bullishMss = barstate.isconfirmed and not na(lastSwingHigh) and close > lastSwingHigh and
+     close[1] <= lastSwingHigh and (na(lastBrokenHighBar) or lastBrokenHighBar != lastSwingHighBar)
+bool bearishMss = barstate.isconfirmed and not na(lastSwingLow) and close < lastSwingLow and
+     close[1] >= lastSwingLow and (na(lastBrokenLowBar) or lastBrokenLowBar != lastSwingLowBar)
+
+if bullishMss
+    lastBrokenHighBar := lastSwingHighBar
+    // The time window qualifies the event here. It is not a visibility filter.
+    if f_isWithinTimeWindow()
+        int candidateState = STATE_MSS_DETECTED
+        [displacementValid, displacementStartBar, displacementEndBar, _] = f_detectDisplacement(DIR_BULL)
+        if displacementValid
+            candidateState := STATE_DISPLACEMENT_IDENTIFIED
+        if candidateState == STATE_DISPLACEMENT_IDENTIFIED
+            [obValid, obBar, obTop, obBottom] = f_identifyDisplacementOb(
+                 DIR_BULL, displacementStartBar, displacementEndBar)
+            if obValid
+                candidateState := STATE_OB_IDENTIFIED
+            if candidateState == STATE_OB_IDENTIFIED
+                [fvgValid, fvgLeftBar, fvgRightBar, fvgTop, fvgBottom] = f_identifyDisplacementFvg(
+                     DIR_BULL, displacementStartBar, displacementEndBar, obBar)
+                if fvgValid
+                    candidateState := STATE_FVG_IDENTIFIED
+                if candidateState == STATE_FVG_IDENTIFIED and f_validateCluster(
+                     bar_index, displacementStartBar, displacementEndBar, obBar, fvgLeftBar, fvgRightBar)
+                    candidateState := STATE_CLUSTER_VALIDATED
+                if candidateState == STATE_CLUSTER_VALIDATED
+                    Cluster cluster = f_buildCluster(DIR_BULL, bar_index, bar_index, lastSwingHigh,
+                         obBar, obTop, obBottom, fvgLeftBar, fvgRightBar,
+                         fvgTop, fvgBottom)
+                    if f_storeCluster(cluster)
+                        f_applyDisplayPolicy(cluster, lastSwingHighBar)
+
+if bearishMss
+    lastBrokenLowBar := lastSwingLowBar
+    if f_isWithinTimeWindow()
+        int candidateState = STATE_MSS_DETECTED
+        [displacementValid, displacementStartBar, displacementEndBar, _] = f_detectDisplacement(DIR_BEAR)
+        if displacementValid
+            candidateState := STATE_DISPLACEMENT_IDENTIFIED
+        if candidateState == STATE_DISPLACEMENT_IDENTIFIED
+            [obValid, obBar, obTop, obBottom] = f_identifyDisplacementOb(
+                 DIR_BEAR, displacementStartBar, displacementEndBar)
+            if obValid
+                candidateState := STATE_OB_IDENTIFIED
+            if candidateState == STATE_OB_IDENTIFIED
+                [fvgValid, fvgLeftBar, fvgRightBar, fvgTop, fvgBottom] = f_identifyDisplacementFvg(
+                     DIR_BEAR, displacementStartBar, displacementEndBar, obBar)
+                if fvgValid
+                    candidateState := STATE_FVG_IDENTIFIED
+                if candidateState == STATE_FVG_IDENTIFIED and f_validateCluster(
+                     bar_index, displacementStartBar, displacementEndBar, obBar, fvgLeftBar, fvgRightBar)
+                    candidateState := STATE_CLUSTER_VALIDATED
+                if candidateState == STATE_CLUSTER_VALIDATED
+                    Cluster cluster = f_buildCluster(DIR_BEAR, bar_index, bar_index, lastSwingLow,
+                         obBar, obTop, obBottom, fvgLeftBar, fvgRightBar,
+                         fvgTop, fvgBottom)
+                    if f_storeCluster(cluster)
+                        f_applyDisplayPolicy(cluster, lastSwingLowBar)
+
+// ───────────────────────────────────────────────
+// Active cluster lifecycle, extension, and deterministic mitigation
+// ───────────────────────────────────────────────
+int clusterCount = array.size(clusters)
+if clusterCount > 0
+    for index = 0 to clusterCount - 1
+        Cluster cluster = array.get(clusters, index)
+        // Extend first so a newly touched zone includes the mitigation bar before
+        // its right edge freezes. Bar-index drawings use +1 to cover the full bar.
+        if cluster.isVisible and extendZones
+            if not extendUntilMitigated or not cluster.obMitigated
+                box.set_right(cluster.obBox, bar_index + 1)
+            if not extendUntilMitigated or not cluster.fvgMitigated
+                box.set_right(cluster.fvgBox, bar_index + 1)
+
+        if bar_index > cluster.creationBar
+            if not cluster.obMitigated and f_zoneTouched(cluster.obTop, cluster.obBottom)
+                cluster.obMitigated := true
+            if not cluster.fvgMitigated and f_zoneTouched(cluster.fvgTop, cluster.fvgBottom)
+                cluster.fvgMitigated := true
+
+        cluster.state := cluster.obMitigated and cluster.fvgMitigated ? STATE_MITIGATED : STATE_ACTIVE
